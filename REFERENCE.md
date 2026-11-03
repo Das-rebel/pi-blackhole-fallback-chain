@@ -110,3 +110,49 @@ Working method:
 - `~/.pi/agent/pi-blackhole/debug.ndjson` — event log (only while `debugLog` is true)
 - `~/.pi/agent/npm/node_modules/pi-blackhole/src/om/runtime.ts` — patched source
 - `~/pi-blackhole-fallback-doctor/patches/runtime.ts` — durable patch copy
+
+---
+
+## Local-model notes (measured on Apple M1 / 8 GB)
+
+- **Tool-call fidelity is model-family specific.** Qwen2.5 base/coder models
+  render the tool schema but emit the call as plain JSON text (ollama
+  issues #13968 and #15798 — "swapping model family is the only reliable
+  option"). Llama 3.2 emits native tool calls.
+- **Temperature 0 is fatal** for structured extraction on small models: greedy
+  decoding deterministically omits the tool-call wrapper (0/5 vs 3/5 at
+  temperature 0.1-0.2).
+- **Cold model load is about 54 s** on this machine; the first call after an
+  idle period is both slow and flakier. Keep the worker resident
+  (`OLLAMA_KEEP_ALIVE`) or accept the cold-start cost.
+- **Only one local model should be in rotation** — ollama evicts/queues on a
+  model switch, and a queued request can exceed the SDK timeout
+  (k0valik/pi-blackhole#112 documents exactly this for single-slot local
+  servers).
+- **Prompt sizing for a 16K local window:** static about 3.5K (system prompt +
+  tool schema) + preamble (memory pool) + chunk. With
+  `observerChunkMaxTokens: 8000` and `observerPreambleMaxTokens: 3000` the
+  total lands near 13K, leaving headroom for output.
+- **Dropper output allowance** is `min(model maxTokens, window / 4)`. A 16K
+  window gives a 4K output allowance; keep the observation pool small enough
+  that the dropper does not need to emit more than that
+  (`dropper.output_allowance_exceeded`).
+- **Observed worker durations** on this hardware: observer 30-60 s (including
+  cold load), reflector about 2 min, dropper under 1 min. Fine for background
+  work, too slow for an interactive path.
+
+## Verification events for a healthy local worker
+
+```
+observer.start             preambleTokens small, chunkTokens within cap
+observer.empty_retry       <- the candidate-continuation patch fired
+model.failed_this_cycle    <- that candidate was skipped for the cycle
+observer.records {count}   <- SUCCESS: observations produced
+observer.appended {count}
+reflector.start / dropper.result
+cursor.saved {observer: "recorded"}
+```
+
+`cursor.saved` with `observer: "recorded"` is the single most important line:
+it means memory was actually written. Before the fix the observer never got
+that far, which is exactly the "blackhole solves nothing" report.

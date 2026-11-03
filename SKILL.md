@@ -115,3 +115,103 @@ file goes stale, and live errors then appear *only* inside the session JSONL
 - `~/.pi/agent/skills/pi-blackhole-fallback-doctor/` — deeper audit + the
   runtime patch source of truth (`audit_fallback_chain.py`).
 - Repo: https://github.com/Das-rebel/pi-blackhole-fallback-doctor
+
+---
+
+## Local worker models (the "small local model" solution)
+
+A blackhole worker that runs a **local** model is the only configuration immune
+to provider 429s, expiring plans and evening throttles. But most small models
+**cannot do the job**: the observer/reflector/dropper stages require a *native
+tool call* (`record_observations` / `reflect` / `drop`), and Qwen2.5-class models
+emit the tool JSON as **plain text** instead.
+
+Verified on this machine (Apple M1, 8 GB) by replaying the real observer
+contract (blackhole's `OBSERVER_SYSTEM` + `RecordObservationsSchema` + a
+source-addressed chunk) against ollama's OpenAI-compatible endpoint:
+
+| Model | Native tool call | Speed | Verdict |
+|-------|------------------|-------|---------|
+| `qwen3:0.6b-8k` | no | 79 s | echoes the chunk — unusable |
+| `qwen2.5-coder:1.5b` | no (text-form JSON) | - | unusable |
+| `qwen2.5:3b` | yes | 47 s | works, slow |
+| `qwen2.5-fast:latest` | yes | 8 s | works |
+| `josie:latest` | yes | 86 s | best quality, slowest |
+| `llama3.2:3b` | yes | 6-18 s | **best choice** — native tool calls, no thinking channel |
+
+Do **not** set `temperature: 0` on these models: greedy decoding
+*deterministically* omits the tool-call wrapper (0/5 success). Use
+`temperature: 0.2` and accept ~80 % per-call success — the
+candidate-continuation patch below covers the rest.
+
+### Working local worker recipe
+
+Modelfile for the worker tag (`num_ctx 16384`, GPU offload, mild sampling):
+
+```
+FROM llama3.2:3b
+PARAMETER num_ctx 16384
+PARAMETER num_gpu -1
+PARAMETER temperature 0.2
+PARAMETER num_predict 1024
+PARAMETER top_p 0.9
+```
+
+Create it with `ollama create bw-worker -f <modelfile>`.
+
+Register it in `~/.pi/agent/models.json` under the `ollama-direct` provider
+(baseUrl `http://127.0.0.1:11434/v1`):
+
+```jsonc
+{ "id": "bw-worker", "name": "Blackhole local worker", "reasoning": false,
+  "contextWindow": 16384, "maxTokens": 4096,
+  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }
+```
+
+Then point all three stages at it, with the remote free models as fallbacks:
+
+```jsonc
+"observerModel":  { "provider": "ollama-direct", "id": "bw-worker", "contextWindow": 16384 },
+"observerFallbackModels": [
+  { "provider": "openrouter", "id": "nvidia/nemotron-3.5-super-vl:free" },
+  { "provider": "openrouter", "id": "nvidia/nemotron-3.5-lightning:free" },
+  { "provider": "zai", "id": "glm-4.5-flash" }
+]
+```
+
+**Shrink the prompt.** A local model cannot digest a 64K prompt. The observer
+prompt is `static (~3.5K) + preamble (memory pool) + chunk`. Upstream issue
+k0valik/pi-blackhole#115: an uncapped preamble grows with the memory pool and
+makes every observer call fail.
+
+```jsonc
+"observerChunkMaxTokens": 8000,     // was 40000
+"observerPreambleMaxTokens": 3000,  // was 0 = auto(30%) => ~24000 observed
+"observationsPoolMaxTokens": 8000,
+"reflectionsPoolMaxTokens": 4000,
+"reflectorInputMaxTokens": 20000,
+"dropperInputMaxTokens": 20000
+```
+
+### The `tool_not_called` patch (essential for local models)
+
+A local model that runs but never calls its tool used to **silently end the
+stage**: the observer returned `"continue"`, the cursor never advanced, and the
+identical chunk failed identically on every future cycle. That is the
+"blackhole solves nothing" symptom.
+
+Patch (applied to `src/om/consolidation.ts` **and** `dist/index.js`):
+
+```ts
+if (reason?.kind === "tool_not_called") {
+  runtime.skipFailedForCycle(stageModelForThinking);
+  debugLog("observer.empty_retry", { coversUpToId, model: provider/id });
+  if (!stageModelForThinking) break;
+  continue;   // let the fallback chain take the next candidate
+}
+```
+
+Durable copy + idempotent re-apply script:
+`~/pi-blackhole-fallback-doctor/patches/apply-patches.sh` (re-run after any
+`npm update pi-blackhole`, then **restart every pi session** — the extension
+runs in-process).
