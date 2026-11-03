@@ -1,0 +1,15 @@
+{
+  "name": "pi-blackhole-fallback-chain",
+  "version": "0.1.0",
+  "description": "Verify and repair pi-blackhole worker fallback chains (observer, reflector, dropper)",
+  "keywords": ["pi-package", "pi-blackhole", "fallback", "observer", "diagnostics"],
+  "license": "MIT",
+  "files": ["SKILL.md", "REFERENCE.md", "scripts/"],
+  "scripts": {
+    "verify": "python3 scripts/verify_fallback_chain.py"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Das-rebel/pi-blackhole-fallback-chain.git"
+  }
+}

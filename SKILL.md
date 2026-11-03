@@ -1,0 +1,117 @@
+---
+name: pi-blackhole-fallback-chain
+description: Verify and repair the pi-blackhole worker fallback chains (observer, reflector, dropper). Use when pi-blackhole reports "observer skipped — all candidates failed", "no model available for observer (all candidates exhausted)", when the observer/dropper never runs, or when a worker chain stops at the first cooldown-skipped provider instead of traversing to the next fallback.
+---
+
+# pi-blackhole fallback chain
+
+The pi-blackhole extension runs three background workers — **observer**,
+**reflector**, **dropper**. Each worker resolves a model through a *chain*:
+
+```
+stage model -> stage fallbacks -> (base config model)   [session fallback disabled]
+```
+
+Two independent things must hold for the chain to work:
+
+1. **Configuration** — every stage declares a non-empty chain, and every member
+   is a real, enabled model with a usable context window.
+2. **Runtime** — a candidate that is skipped (cooldown, size) must **continue**
+   to the next candidate. Older `pi-blackhole` builds *stop* traversal at the
+   first cooldown skip, which surfaces as
+   `no model available for observer (all candidates exhausted, sessionFallback disabled)`.
+
+## Run the verifier
+
+```bash
+python3 ~/.pi/agent/skills/pi-blackhole-fallback-chain/scripts/verify_fallback_chain.py
+```
+
+Exit codes: `0` usable, `1` broken, `2` config/IO error.
+
+Checks performed:
+
+| Code | Level | Meaning |
+|------|-------|---------|
+| C1 | FAIL | stage chain empty or missing |
+| C2 | FAIL | chain member not a known provider/model pair |
+| C3 | FAIL | chain member disabled in `models.json` |
+| C4 | FAIL | chain member has no context window (would be size-skipped) |
+| W1 | WARN | no explicit `contextWindow` override on the member |
+| W2 | WARN | member is currently in provider cooldown |
+| W3 | INFO | member is a local (ollama) fallback — survives provider outages |
+| R1 | FAIL | runtime patch missing — chain stops at the first cooldown skip |
+| R2 | INFO | runtime patch present |
+
+## Configuration shape
+
+Chains live in `~/.pi/agent/pi-blackhole/pi-blackhole-config.json` under
+**top-level** keys — *not* nested inside the stage model object:
+
+```jsonc
+{
+  "observerModel":  { "provider": "openrouter", "model": "nvidia/nemotron-3.5-super-vl:free" },
+  "observerFallbackModels": [
+    { "provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free" },
+    { "provider": "zai",         "model": "glm-4.5-flash" },
+    { "provider": "ollama-direct", "model": "qwen3:0.6b-8k", "contextWindow": 81920 }
+  ],
+  "reflectorModel": { ... }, "reflectorFallbackModels": [ ... ],
+  "dropperModel":   { ... }, "dropperFallbackModels":   [ ... ],
+
+  "workerAttemptTimeoutMs": 420000,
+  "observeOnShutdown": true,
+  "observeAfterTokens": 15000
+}
+```
+
+Rules that matter in practice:
+
+- **Always end the chain in a local model** (`ollama-direct/...`). Remote free
+  providers rotate through 429s; a local tail keeps the observer alive.
+- **Give the local tail an explicit `contextWindow`** larger than the ollama
+  model's real `num_ctx`. Blackhole decides "fits" from this value, and ollama
+  silently head-truncates oversized prompts instead of erroring, so over-declaring
+  is safe while under-declaring causes a size-skip.
+- **Set `workerAttemptTimeoutMs`** (e.g. `420000`). Unset means "no deadline" —
+  a hung provider stalls the worker forever.
+- Keep the *same* chain shape for all three stages; the resolver is shared.
+
+## Runtime patch (the skip → continue fix)
+
+Upstream `pi-blackhole` stops the candidate loop after the first cooldown skip.
+The fix replaces that with `continue` and enriches the skip log with
+`until` / `reason` / `cooldownStage`.
+
+Durable copies live in the sibling repo `~/pi-blackhole-fallback-doctor`:
+
+```bash
+# re-apply after any `npm update pi-blackhole` (node_modules is wiped)
+cp ~/pi-blackhole-fallback-doctor/patches/runtime.ts \
+   ~/.pi/agent/npm/node_modules/pi-blackhole/src/om/runtime.ts
+```
+
+The installed bundle `dist/index.js` must also contain the fix (`grep -c
+cooldownStage`). Then **restart every pi session** — running processes keep the
+old code in memory.
+
+## Diagnosing a live failure
+
+1. `python3 ~/.pi/agent/skills/pi-blackhole-fallback-chain/scripts/verify_fallback_chain.py`
+2. Inspect cooldowns: `cat ~/.pi/agent/pi-blackhole/pi-blackhole-cooldown.json`
+   (keys are `provider/model`, lowercased).
+3. Enable `debugLog: true` in the config, reproduce, then read
+   `~/.pi/agent/pi-blackhole/debug.ndjson` — look for `model.cooldown_skip`,
+   `observer.model_unavailable`, `observer.records`, `cursor.saved`.
+4. Clear cooldowns by deleting the offending keys from the cooldown file.
+
+**Note:** `debug.ndjson` only exists while `debugLog` is true — with it off the
+file goes stale, and live errors then appear *only* inside the session JSONL
+(`~/.pi/agent/sessions/<project>/<session>.jsonl`) as assistant entries with
+`stopReason: length`.
+
+## Related
+
+- `~/.pi/agent/skills/pi-blackhole-fallback-doctor/` — deeper audit + the
+  runtime patch source of truth (`audit_fallback_chain.py`).
+- Repo: https://github.com/Das-rebel/pi-blackhole-fallback-doctor
