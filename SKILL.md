@@ -1,217 +1,131 @@
 ---
 name: pi-blackhole-fallback-chain
-description: Verify and repair the pi-blackhole worker fallback chains (observer, reflector, dropper). Use when pi-blackhole reports "observer skipped — all candidates failed", "no model available for observer (all candidates exhausted)", when the observer/dropper never runs, or when a worker chain stops at the first cooldown-skipped provider instead of traversing to the next fallback.
+description: >-
+  Configure, verify and repair the pi-blackhole observer/reflector/dropper model
+  chains so observational memory actually gets written. Use when blackhole reports
+  "observer skipped - all candidates failed", "no observations - model did not call
+  the observation tool", "all candidates exhausted", or when memory is never
+  persisted. Also use when choosing worker models, sizing observer prompts, or
+  deciding whether a local ollama model can serve as a blackhole worker.
 ---
 
 # pi-blackhole fallback chain
 
-The pi-blackhole extension runs three background workers — **observer**,
-**reflector**, **dropper**. Each worker resolves a model through a *chain*:
+The observer/reflector/dropper chain decides whether pi-blackhole writes anything to
+memory. This skill covers the measured-good worker configuration, how to verify a
+live chain, and the failure modes that silently produce zero memory.
 
+## The one thing to understand first
+
+**Memory is only written when the observer cursor reaches state `recorded`.** A worker
+that runs but never calls its tool must be treated as a *candidate failure*, and the
+chain must advance to the next candidate. Before the local patch, a `tool_not_called`
+result returned `"continue"` without advancing the chain *and* without moving the
+cursor — so the same chunk failed identically forever. That is the "blackhole solves
+nothing" symptom.
+
+A worker that calls the tool but extracts **nothing useful** is nearly as bad: the
+observation is written to disk permanently and the dropper may never remove it.
+
+## Decision metric: coverage with grounded source ids
+
+Do **not** select a worker on tool-call rate. Every model tested can call the tool.
+Score on:
+
+- **coverage** — fraction of the chunk's durable facts the worker actually surfaced
+- **grounded source ids** — do the `sourceEntryIds` exist in the chunk, or are they
+  invented?
+- **preamble leakage** — did it record the already-known memory instead of the new chunk?
+
+A model with a 100% tool-call rate, 0.0 coverage and 0/15 grounded ids is worse than
+one that fails loudly.
+
+## Measured worker ranking (2026-11-04)
+
+Real observer contract, real `record_observations` tool schema, disjoint
+already-known vs new fact pools, production prompt size, `max_tokens=16384`,
+2 reps each:
+
+| Worker | Cost | Median latency | Coverage | Grounded ids | Leak | Verdict |
+|---|---|---|---|---|---|---|
+| `openrouter/nvidia/nemotron-3.5-super-vl:free` | free | 33.3 s | **0.923** | 24/24 | 0 | **primary** |
+| `openrouter/liquid/lfm-2.5-2.6b:free` | free | **5.2 s** | 0.616 | 19/19 | 0 | **fallback 1 — the tiny model** |
+| `zai-2/glm-5.3` (`thinking: low`) | paid | 56.7 s | 0.846 | 29/29 | 0 | fallback 2 |
+| `openrouter/nvidia/nemotron-3.5-lightning:free` | free | 51 s | 0.00 | — | — | rejected |
+| `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` | free | 300 s timeout | — | — | — | rejected |
+| `openrouter/google/gemini-2.5-flash:free` | — | HTTP 404 (no longer free) | — | — | — | rejected |
+| `ollama` `qwen2.5-fast:3.1b` | free | 102 s | 0.286 | **0/15** | — | rejected — hallucinates ids |
+| `ollama` `qwen2.5-coder:1.5b` | free | 45 s | 0.00 | 12/12 | wrong target | rejected — records the preamble |
+| `ollama` `llama3.2:3b` | free | errors | — | — | — | rejected |
+
+`liquid/lfm-2.5-2.6b:free` is the **extremely small model** (2.6B): free, 5 seconds,
+100% grounded ids. It is the fastest usable worker and the right fallback.
+
+Local ollama models are **excluded** because their observations would be persisted
+with invented source ids. Re-admit them only after an observation-validation gate
+exists.
+
+## The working configuration
+
+`~/.pi/agent/pi-blackhole/pi-blackhole-config.json`:
+
+```json
+{
+  "observerModel":  { "provider": "openrouter", "id": "nvidia/nemotron-3.5-super-vl:free", "contextWindow": 32768 },
+  "reflectorModel": { "provider": "openrouter", "id": "nvidia/nemotron-3.5-super-vl:free", "contextWindow": 32768 },
+  "dropperModel":   { "provider": "openrouter", "id": "nvidia/nemotron-3.5-super-vl:free", "contextWindow": 32768 },
+  "observerFallbackModels": [
+    { "provider": "openrouter", "id": "liquid/lfm-2.5-2.6b:free", "contextWindow": 32768 },
+    { "provider": "zai-2",        "id": "glm-5.3",                    "contextWindow": 72000 }
+  ],
+  "reflectorFallbackModels": [ /* same two */ ],
+  "dropperFallbackModels":   [ /* same two */ ],
+  "observerChunkMaxTokens": 4000,
+  "observerPreambleMaxTokens": 1500,
+  "observationsPoolMaxTokens": 8000,
+  "reflectionsPoolMaxTokens": 4000,
+  "reflectorInputMaxTokens": 8000,
+  "dropperInputMaxTokens": 8000,
+  "workerAttemptTimeoutMs": 420000
+}
 ```
-stage model -> stage fallbacks -> (base config model)   [session fallback disabled]
-```
 
-Two independent things must hold for the chain to work:
+`~/.pi/agent/models.json` needs `liquid/lfm-2.5-2.6b:free` registered under the
+`openrouter` provider's `modelOverrides` (models.json resolves models from **both**
+`provider.models` and `provider.modelOverrides`).
 
-1. **Configuration** — every stage declares a non-empty chain, and every member
-   is a real, enabled model with a usable context window.
-2. **Runtime** — a candidate that is skipped (cooldown, size) must **continue**
-   to the next candidate. Older `pi-blackhole` builds *stop* traversal at the
-   first cooldown skip, which surfaces as
-   `no model available for observer (all candidates exhausted, sessionFallback disabled)`.
+`zai-2/glm-5.3` needs `reasoning: true` in models.json — GLM-5.3 **cannot disable
+thinking** and rejects `thinking: off` with error `1210`; pi sends `thinking: low`
+because `settings.json` has `defaultThinkingLevel: "low"`.
 
-## Run the verifier
+## Verify
 
 ```bash
 python3 ~/.pi/agent/skills/pi-blackhole-fallback-chain/scripts/verify_fallback_chain.py
 ```
 
-Exit codes: `0` usable, `1` broken, `2` config/IO error.
+Exit `0` and `VERDICT: USABLE` means the chains resolve. Then confirm the pipeline
+actually completes, not just that it resolves — see `REFERENCE.md` for the live
+end-to-end procedure and the log fields to look for.
 
-Checks performed:
+## Failure modes
 
-| Code | Level | Meaning |
-|------|-------|---------|
-| C1 | FAIL | stage chain empty or missing |
-| C2 | FAIL | chain member not a known provider/model pair |
-| C3 | FAIL | chain member disabled in `models.json` |
-| C4 | FAIL | chain member has no context window (would be size-skipped) |
-| W1 | WARN | no explicit `contextWindow` override on the member |
-| W2 | WARN | member is currently in provider cooldown |
-| W3 | INFO | member is a local (ollama) fallback — survives provider outages |
-| R1 | FAIL | runtime patch missing — chain stops at the first cooldown skip |
-| R2 | INFO | runtime patch present |
+| Symptom | Cause | Fix |
+|---|---|---|
+| "observer skipped — all candidates failed" | cooldown/size skip terminated traversal | apply the runtime skip→continue patch |
+| "no observations — model did not call the observation tool" | worker's tool-call failure silently ended the stage | apply the `tool_not_called` → next-candidate patch |
+| observations contain the *old* memory | worker recorded the preamble, not the chunk | choose a worker with coverage > 0.5 |
+| `sourceEntryIds` that match nothing | worker hallucinated ids | choose a worker with 100% grounded ids |
+| worker truncated its output (`finish=length`) | output cap too low for the model | raise the output allowance; `max_tokens=16384` was needed |
 
-## Configuration shape
+## Traps
 
-Chains live in `~/.pi/agent/pi-blackhole/pi-blackhole-config.json` under
-**top-level** keys — *not* nested inside the stage model object:
-
-```jsonc
-{
-  "observerModel":  { "provider": "openrouter", "model": "nvidia/nemotron-3.5-super-vl:free" },
-  "observerFallbackModels": [
-    { "provider": "openrouter", "model": "nvidia/nemotron-3.5-lightning:free" },
-    { "provider": "zai",         "model": "glm-4.5-flash" },
-    { "provider": "ollama-direct", "model": "qwen3:0.6b-8k", "contextWindow": 81920 }
-  ],
-  "reflectorModel": { ... }, "reflectorFallbackModels": [ ... ],
-  "dropperModel":   { ... }, "dropperFallbackModels":   [ ... ],
-
-  "workerAttemptTimeoutMs": 420000,
-  "observeOnShutdown": true,
-  "observeAfterTokens": 15000
-}
-```
-
-Rules that matter in practice:
-
-- **Always end the chain in a local model** (`ollama-direct/...`). Remote free
-  providers rotate through 429s; a local tail keeps the observer alive.
-- **Give the local tail an explicit `contextWindow`** larger than the ollama
-  model's real `num_ctx`. Blackhole decides "fits" from this value, and ollama
-  silently head-truncates oversized prompts instead of erroring, so over-declaring
-  is safe while under-declaring causes a size-skip.
-- **Set `workerAttemptTimeoutMs`** (e.g. `420000`). Unset means "no deadline" —
-  a hung provider stalls the worker forever.
-- Keep the *same* chain shape for all three stages; the resolver is shared.
-
-## Runtime patch (the skip → continue fix)
-
-Upstream `pi-blackhole` stops the candidate loop after the first cooldown skip.
-The fix replaces that with `continue` and enriches the skip log with
-`until` / `reason` / `cooldownStage`.
-
-Durable copies live in the sibling repo `~/pi-blackhole-fallback-doctor`:
-
-```bash
-# re-apply after any `npm update pi-blackhole` (node_modules is wiped)
-cp ~/pi-blackhole-fallback-doctor/patches/runtime.ts \
-   ~/.pi/agent/npm/node_modules/pi-blackhole/src/om/runtime.ts
-```
-
-The installed bundle `dist/index.js` must also contain the fix (`grep -c
-cooldownStage`). Then **restart every pi session** — running processes keep the
-old code in memory.
-
-## Diagnosing a live failure
-
-1. `python3 ~/.pi/agent/skills/pi-blackhole-fallback-chain/scripts/verify_fallback_chain.py`
-2. Inspect cooldowns: `cat ~/.pi/agent/pi-blackhole/pi-blackhole-cooldown.json`
-   (keys are `provider/model`, lowercased).
-3. Enable `debugLog: true` in the config, reproduce, then read
-   `~/.pi/agent/pi-blackhole/debug.ndjson` — look for `model.cooldown_skip`,
-   `observer.model_unavailable`, `observer.records`, `cursor.saved`.
-4. Clear cooldowns by deleting the offending keys from the cooldown file.
-
-**Note:** `debug.ndjson` only exists while `debugLog` is true — with it off the
-file goes stale, and live errors then appear *only* inside the session JSONL
-(`~/.pi/agent/sessions/<project>/<session>.jsonl`) as assistant entries with
-`stopReason: length`.
-
-## Related
-
-- `~/.pi/agent/skills/pi-blackhole-fallback-doctor/` — deeper audit + the
-  runtime patch source of truth (`audit_fallback_chain.py`).
-- Repo: https://github.com/Das-rebel/pi-blackhole-fallback-doctor
-
----
-
-## Local worker models (the "small local model" solution)
-
-A blackhole worker that runs a **local** model is the only configuration immune
-to provider 429s, expiring plans and evening throttles. But most small models
-**cannot do the job**: the observer/reflector/dropper stages require a *native
-tool call* (`record_observations` / `reflect` / `drop`), and Qwen2.5-class models
-emit the tool JSON as **plain text** instead.
-
-Verified on this machine (Apple M1, 8 GB) by replaying the real observer
-contract (blackhole's `OBSERVER_SYSTEM` + `RecordObservationsSchema` + a
-source-addressed chunk) against ollama's OpenAI-compatible endpoint:
-
-| Model | Native tool call | Speed | Verdict |
-|-------|------------------|-------|---------|
-| `qwen3:0.6b-8k` | no | 79 s | echoes the chunk — unusable |
-| `qwen2.5-coder:1.5b` | no (text-form JSON) | - | unusable |
-| `qwen2.5:3b` | yes | 47 s | works, slow |
-| `qwen2.5-fast:latest` | yes | 8 s | works |
-| `josie:latest` | yes | 86 s | best quality, slowest |
-| `llama3.2:3b` | yes | 6-18 s | **best choice** — native tool calls, no thinking channel |
-
-Do **not** set `temperature: 0` on these models: greedy decoding
-*deterministically* omits the tool-call wrapper (0/5 success). Use
-`temperature: 0.2` and accept ~80 % per-call success — the
-candidate-continuation patch below covers the rest.
-
-### Working local worker recipe
-
-Modelfile for the worker tag (`num_ctx 16384`, GPU offload, mild sampling):
-
-```
-FROM llama3.2:3b
-PARAMETER num_ctx 16384
-PARAMETER num_gpu -1
-PARAMETER temperature 0.2
-PARAMETER num_predict 1024
-PARAMETER top_p 0.9
-```
-
-Create it with `ollama create bw-worker -f <modelfile>`.
-
-Register it in `~/.pi/agent/models.json` under the `ollama-direct` provider
-(baseUrl `http://127.0.0.1:11434/v1`):
-
-```jsonc
-{ "id": "bw-worker", "name": "Blackhole local worker", "reasoning": false,
-  "contextWindow": 16384, "maxTokens": 4096,
-  "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 } }
-```
-
-Then point all three stages at it, with the remote free models as fallbacks:
-
-```jsonc
-"observerModel":  { "provider": "ollama-direct", "id": "bw-worker", "contextWindow": 16384 },
-"observerFallbackModels": [
-  { "provider": "openrouter", "id": "nvidia/nemotron-3.5-super-vl:free" },
-  { "provider": "openrouter", "id": "nvidia/nemotron-3.5-lightning:free" },
-  { "provider": "zai", "id": "glm-4.5-flash" }
-]
-```
-
-**Shrink the prompt.** A local model cannot digest a 64K prompt. The observer
-prompt is `static (~3.5K) + preamble (memory pool) + chunk`. Upstream issue
-k0valik/pi-blackhole#115: an uncapped preamble grows with the memory pool and
-makes every observer call fail.
-
-```jsonc
-"observerChunkMaxTokens": 8000,     // was 40000
-"observerPreambleMaxTokens": 3000,  // was 0 = auto(30%) => ~24000 observed
-"observationsPoolMaxTokens": 8000,
-"reflectionsPoolMaxTokens": 4000,
-"reflectorInputMaxTokens": 20000,
-"dropperInputMaxTokens": 20000
-```
-
-### The `tool_not_called` patch (essential for local models)
-
-A local model that runs but never calls its tool used to **silently end the
-stage**: the observer returned `"continue"`, the cursor never advanced, and the
-identical chunk failed identically on every future cycle. That is the
-"blackhole solves nothing" symptom.
-
-Patch (applied to `src/om/consolidation.ts` **and** `dist/index.js`):
-
-```ts
-if (reason?.kind === "tool_not_called") {
-  runtime.skipFailedForCycle(stageModelForThinking);
-  debugLog("observer.empty_retry", { coversUpToId, model: provider/id });
-  if (!stageModelForThinking) break;
-  continue;   // let the fallback chain take the next candidate
-}
-```
-
-Durable copy + idempotent re-apply script:
-`~/pi-blackhole-fallback-doctor/patches/apply-patches.sh` (re-run after any
-`npm update pi-blackhole`, then **restart every pi session** — the extension
-runs in-process).
+- **`num_ctx` must be ≥ 8192 for ollama.** The observer prompt floor is ~3900 tokens
+  (a 14.3k-char blackhole system prompt + tool schema). At `num_ctx 4096` ollama
+  silently truncates and the model regurgitates the tool schema as fake observations.
+- **A long-running ollama server can enter a dead Metal state**
+  (`failed to initialize the Metal library` → HTTP 500 for every model). `num_gpu 0`
+  does not avoid it. Restart the server; the same tag then answers in ~2.5 s.
+- **Send `keep_alive: 0`** on every ollama request when benchmarking, or each visited
+  model stays resident (~2 GB each) and the 8 GB box swaps itself to death.
+- **`models.json` model entries use the key `id`**, not `model`.
